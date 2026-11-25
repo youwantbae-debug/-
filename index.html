@@ -38,7 +38,7 @@
     <h2>두 트랙 합쳐 듣기</h2>
     <div class="grid" id="choices"></div>
     <div class="row">
-      <label>미리 듣기 BPM <input id="bpm" type="number" min="30" max="300" value="90"></label>
+      <label>재생·저장 BPM <input id="bpm" type="number" min="30" max="300" value="90"></label>
       <label>합쳐 듣기 음량 <input id="mixVolume" type="range" min="0" max="100" value="100"></label>
     </div>
     <div class="row">
@@ -46,6 +46,12 @@
       <button id="save" disabled>MIDI 저장</button>
       <button id="mixStop" disabled>합쳐 듣기 정지</button>
     </div>
+    <div class="row">
+      <label>파일 2 베이스 <select id="bass"><option value="">사용 안 함</option></select></label>
+      <label>베이스 시작 마디 <input id="bassBar" type="number" min="1" step="1" value="1" disabled></label>
+      <label>베이스 음높이 <select id="bassMode"><option value="original">원본</option><option value="follow">화음에 맞춤</option></select></label>
+    </div>
+    <small>화음에 맞춤은 파일 1의 각 마디에 많이 등장하는 음을 참고해 베이스 음을 조정합니다.</small>
     <p class="status" id="mixStatus" role="status">MIDI 파일 두 개를 열어 주세요.</p>
     <small>저장 형식은 90 BPM · 4/4 · 4마디입니다. 드럼은 채널 10으로 저장합니다.</small>
   </section>
@@ -209,7 +215,7 @@ function voice(note, time, destination) {
     source.connect(filter).connect(envelope);
   } else {
     source = audio.createOscillator();
-    source.type = drum ? 'sine' : 'triangle';
+    source.type = drum || note.role === 'bass' ? 'sine' : 'triangle';
     if (drum) {
       source.frequency.setValueAtTime(140, time);
       source.frequency.exponentialRampToValueAtTime(42, time + length);
@@ -457,6 +463,21 @@ function addTrack(container, track, players) {
   draw(0);
 }
 
+function refreshBass(tracks) {
+  $('bass').replaceChildren(new Option('사용 안 함', ''));
+  tracks.forEach((track, index) => {
+    if (track.fourFour && track.notes.every(n => n.channel !== 9))
+      $('bass').append(new Option(track.name, index));
+  });
+  $('bassBar').value = 1;
+  $('bassBar').disabled = true;
+}
+$('bass').onchange = () => {
+  $('bassBar').disabled = $('bass').value === '';
+  if (mix.running) stopMix();
+};
+$('bassMode').onchange = $('bassBar').oninput = () => { if (mix.running) stopMix(); };
+
 function refresh() {
   const ready = parts.every(part => part.tracks.some(track => track.fourFour));
   $('mixPlay').disabled = $('save').disabled = !ready;
@@ -486,6 +507,7 @@ for (let i = 0; i < 2; i++) {
     if (mix.running) stopMix();
     for (const player of part.players) player.stop();
     part.tracks = [];
+    if (i === 1) refreshBass([]);
     part.players = [];
     list.replaceChildren();
     select.replaceChildren();
@@ -497,6 +519,7 @@ for (let i = 0; i < 2; i++) {
       const tracks = parseMidi(await selected.arrayBuffer());
       if (load !== part.load) return;
       part.tracks = tracks;
+      if (i === 1) refreshBass(tracks);
       info.textContent = `${selected.name} · 음표가 있는 트랙 ${tracks.length}개`;
       tracks.forEach((track, index) => {
         const option = new Option(track.name, index);
@@ -517,25 +540,58 @@ for (let i = 0; i < 2; i++) {
   };
 }
 
-function selectedNotes() {
-  return parts.flatMap(({ tracks, select, bar }) => {
-    const track = tracks[select.selectedIndex], startBar = bar.valueAsNumber;
-    if (!track?.fourFour) throw Error('파일마다 4/4 트랙 하나를 선택하세요.');
-    if (!Number.isSafeInteger(startBar) || startBar < 1) throw Error('시작 마디는 1 이상의 정수로 입력하세요.');
-    const start = (startBar - 1) * 4, end = start + 16;
-    if (start >= track.endBeat) throw Error('시작 마디를 트랙 안으로 지정하세요.');
-    return track.notes.filter(n => n.beat < end && n.beat + n.beats > start).map(n => {
-      const first = Math.max(n.beat, start);
-      const last = Math.min(n.beat + n.beats, end);
-      return { ...n, beat: first - start, beats: last - first };
-    });
+function crop(track, startBar, role) {
+  if (!track?.fourFour) throw Error('4/4 트랙을 선택하세요.');
+  if (!Number.isSafeInteger(startBar) || startBar < 1) throw Error('시작 마디는 1 이상의 정수로 입력하세요.');
+  const start = (startBar - 1) * 4, end = start + 16;
+  if (start >= track.endBeat) throw Error('시작 마디를 트랙 안으로 지정하세요.');
+  return track.notes.filter(n => n.beat < end && n.beat + n.beats > start).map(n => {
+    const first = Math.max(n.beat, start);
+    const last = Math.min(n.beat + n.beats, end);
+    return { ...n, role, beat: first - start, beats: last - first };
   });
+}
+
+function selectedNotes() {
+  const [first, second] = parts.map(({ tracks, select, bar }, i) =>
+    crop(tracks[select.selectedIndex], bar.valueAsNumber, i === 0 ? 'first' : 'second'));
+  if ($('bass').value === '') return [...first, ...second];
+  if (Number($('bass').value) === parts[1].select.selectedIndex)
+    throw Error('파일 2의 기본 트랙과 베이스 트랙은 다르게 선택하세요.');
+  const bass = crop(parts[1].tracks[Number($('bass').value)], $('bassBar').valueAsNumber, 'bass');
+  if (!bass.length) throw Error('선택한 베이스 구간에 음표가 없습니다.');
+  if ($('bassMode').value === 'follow') {
+    const pitched = first.filter(n => n.channel !== 9);
+    if (!pitched.length) throw Error('파일 1에서 피아노처럼 음높이가 있는 트랙을 선택하세요.');
+    const targets = Array.from({length: 4}, (_, bar) => {
+      const scores = Array(12).fill(0);
+      for (const n of pitched) {
+        const overlap = Math.min(n.beat + n.beats, bar * 4 + 4) - Math.max(n.beat, bar * 4);
+        if (overlap > 0) scores[n.key % 12] += overlap;
+      }
+      return scores.map((score, pc) => ({score, pc})).filter(n => n.score > 0)
+        .sort((a,b) => b.score - a.score).slice(0,3).map(n => n.pc);
+    });
+    for (const note of bass) {
+      const allowed = targets[Math.floor(note.beat / 4)];
+      for (let d = 0; d <= 6; d++) {
+        const key = [note.key - d, note.key + d].find(k => k >= 0 && k <= 127 && allowed.includes(k % 12));
+        if (key !== undefined) { note.key = key; break; }
+      }
+    }
+  }
+  return [...first, ...second, ...bass];
+}
+
+function selectedBpm() {
+  const bpm = $('bpm').valueAsNumber;
+  if (!(bpm >= 30 && bpm <= 300)) throw Error('BPM을 30~300 사이로 입력하세요.');
+  return bpm;
 }
 
 $('mixPlay').onclick = () => {
   try {
-    const bpm = $('bpm').valueAsNumber;
-    if (!(bpm >= 30 && bpm <= 300)) throw Error('BPM을 30~300 사이로 입력하세요.');
+    const bpm = selectedBpm();
     const seconds = 60 / bpm;
     const notes = selectedNotes().map(n => ({
       ...n, start: n.beat * seconds, duration: n.beats * seconds
@@ -547,7 +603,7 @@ $('mixPlay').onclick = () => {
   } catch (error) { $('mixStatus').textContent = error.message; }
 };
 
-function midiBytes(notes) {
+function midiBytes(notes, bpm) {
   const ppqn = 960, endTick = 16 * ppqn;
   function vlq(value) {
     const bytes = [value & 127];
@@ -572,33 +628,38 @@ function midiBytes(notes) {
     data.push(...vlq(endTick - last), 255, 47, 0);
     return chunk('MTrk', data);
   }
-  const piano = [{ tick: 0, order: -1, bytes: [192, 0] }], drums = [];
+  const groups = new Map();
   for (const note of notes) {
-    const ch = note.channel === 9 ? 9 : 0;
-    const events = ch === 9 ? drums : piano;
+    const ch = note.channel === 9 ? 9 : note.role === 'bass' ? 2 : note.role === 'second' ? 1 : 0;
+    const name = (note.role === 'bass' ? 'Bass' : note.role === 'second' ? 'Track 2' : 'Track 1')
+      + (ch === 9 ? ' Drums' : '');
+    if (!groups.has(name)) groups.set(name, ch === 9 ? [] : [
+      { tick: 0, order: -1, bytes: [192 | ch, note.role === 'bass' ? 33 : 0] }
+    ]);
+    const events = groups.get(name);
     const start = Math.min(endTick - 1, Math.round(note.beat * ppqn));
     const end = Math.min(endTick, Math.max(start + 1, Math.round((note.beat + note.beats) * ppqn)));
     events.push({ tick: start, order: 1, bytes: [144 | ch, note.key, note.velocity] });
     events.push({ tick: end, order: 0, bytes: [128 | ch, note.key, 0] });
   }
-  const tempo = 666667;
+  const tempo = Math.round(60000000 / bpm);
   return [
-    chunk('MThd', [0, 1, 0, 3, ppqn >> 8, ppqn & 255]),
+    chunk('MThd', [0, 1, (groups.size + 1) >> 8, (groups.size + 1) & 255, ppqn >> 8, ppqn & 255]),
     track('Tempo', [
       { tick: 0, order: 0, bytes: [255, 81, 3, tempo >> 16, tempo >> 8 & 255, tempo & 255] },
       { tick: 0, order: 1, bytes: [255, 88, 4, 4, 2, 24, 8] }
     ]),
-    track('Piano', piano),
-    track('Drums', drums)
+    ...Array.from(groups, ([name, events]) => track(name, events))
   ];
 }
 
 $('save').onclick = () => {
   try {
-    const url = URL.createObjectURL(new Blob(midiBytes(selectedNotes()), { type: 'audio/midi' }));
+    const bpm = selectedBpm();
+    const url = URL.createObjectURL(new Blob(midiBytes(selectedNotes(), bpm), { type: 'audio/midi' }));
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'midi-room-4bars-90bpm.mid';
+    link.download = `midi-room-4bars-${bpm}bpm.mid`;
     document.body.append(link);
     link.click();
     link.remove();
