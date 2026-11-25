@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MIDI Room</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #131914; color: #eff4eb; font: 16px system-ui; color-scheme: dark }
+  main { max-width: 1100px; margin: auto; padding: 28px 18px }
+  h1 { font-size: clamp(34px, 7vw, 62px); margin: 12px 0 }
+  h2, h3 { margin: 0 0 12px }
+  p, small, label { color: #bbcbb4 }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px }
+  section { padding: 18px; border: 1px solid #42523d; border-radius: 14px; background: #1d271e }
+  .mix { margin-top: 18px }
+  article { border-top: 1px solid #42523d; padding: 16px 0 }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 }
+  input, select, button { font: inherit; max-width: 100% }
+  button, select, input[type=number] { padding: 8px; border: 1px solid #637559; border-radius: 6px; background: #263628 }
+  button { cursor: pointer }
+  button.primary { background: #c6e69c; color: #152013; font-weight: 700 }
+  button:disabled { opacity: .5; cursor: default }
+  input[type=number] { width: 85px }
+  input[type=range] { accent-color: #c6e69c; vertical-align: middle }
+  .seek, canvas { display: block; width: 100%; margin: 9px 0 }
+  canvas { height: 106px; border: 1px solid #53684c; border-radius: 6px; cursor: crosshair }
+  .choice label { display: block; margin-bottom: 8px }
+  .choice select { display: block; width: 100% }
+  .status { min-height: 24px; overflow-wrap: anywhere }
+  @media (max-width: 690px) { .grid { grid-template-columns: 1fr } }
+</style>
+<main>
+  <h1>MIDI Room</h1>
+  <p>MIDI 파일 두 개를 열고, 원하는 트랙과 구간을 들어보세요.</p>
+  <div class="row"><button id="stopAll">모두 정지</button></div>
+  <div class="grid" id="files"></div>
+  <section class="mix">
+    <h2>두 트랙 합쳐 듣기</h2>
+    <div class="grid" id="choices"></div>
+    <div class="row">
+      <label>미리 듣기 BPM <input id="bpm" type="number" min="30" max="300" value="90"></label>
+      <label>합쳐 듣기 음량 <input id="mixVolume" type="range" min="0" max="100" value="100"></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="mixPlay" disabled>4마디 합쳐 듣기</button>
+      <button id="save" disabled>MIDI 저장</button>
+      <button id="mixStop" disabled>합쳐 듣기 정지</button>
+    </div>
+    <p class="status" id="mixStatus" role="status">MIDI 파일 두 개를 열어 주세요.</p>
+    <small>저장 형식은 90 BPM · 4/4 · 4마디입니다. 드럼은 채널 10으로 저장합니다.</small>
+  </section>
+</main>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+function parseMidi(buffer) {
+  const view = new DataView(buffer);
+  let pos = 0, limit = view.byteLength;
+  function number(size) {
+    if (pos + size > limit) throw Error('MIDI 데이터가 잘렸습니다.');
+    const value = size === 1 ? view.getUint8(pos)
+      : size === 2 ? view.getUint16(pos) : view.getUint32(pos);
+    pos += size;
+    return value;
+  }
+  function variable() {
+    let value = 0;
+    for (let i = 0; i < 4; i++) {
+      const byte = number(1);
+      value = value * 128 + (byte & 127);
+      if (!(byte & 128)) return value;
+    }
+    throw Error('MIDI 이벤트 길이가 올바르지 않습니다.');
+  }
+  if (number(4) !== 0x4d546864) throw Error('표준 MIDI 파일을 선택하세요.');
+  const header = number(4);
+  if (header < 6 || header + 8 > limit) throw Error('MIDI 헤더가 올바르지 않습니다.');
+  const format = number(2), count = number(2), ppqn = number(2);
+  if (format > 1 || !ppqn || ppqn & 32768) {
+    throw Error('박 기반 MIDI 형식 0 또는 1을 열어 주세요.');
+  }
+  pos = header + 8;
+  const tempos = [{ tick: 0, value: 500000 }];
+  const tracks = [];
+  let fourFour = true;
+  for (let tr = 0; tr < count; tr++) {
+    if (number(4) !== 0x4d54726b) throw Error('MIDI 트랙을 읽을 수 없습니다.');
+    const size = number(4);
+    limit = pos + size;
+    if (limit > view.byteLength) throw Error('MIDI 트랙이 잘렸습니다.');
+    const active = new Map(), notes = [];
+    let tick = 0, running = 0, name = '';
+    while (pos < limit) {
+      tick += variable();
+      let status = number(1);
+      if (status < 128) {
+        if (!running) throw Error('MIDI 상태 바이트가 없습니다.');
+        pos--;
+        status = running;
+      } else if (status < 240) running = status;
+      if (status === 255 || status === 240 || status === 247) {
+        const type = status === 255 ? number(1) : -1;
+        if (status !== 255) running = 0;
+        const length = variable();
+        const end = pos + length;
+        if (end > limit) throw Error('MIDI 이벤트가 잘렸습니다.');
+        if (type === 3) {
+          name = new TextDecoder().decode(new Uint8Array(buffer, pos, length))
+            .replaceAll('\0', '').trim();
+        }
+        if (type === 81 && length === 3) {
+          const value = number(1) * 65536 + number(1) * 256 + number(1);
+          if (value > 0) tempos.push({ tick, value });
+        }
+        if (type === 88 && length >= 2) {
+          const numerator = number(1), denominator = number(1);
+          fourFour = fourFour && numerator === 4 && denominator === 2;
+        }
+        pos = end;
+        if (type === 47) break;
+        continue;
+      }
+      const kind = status >> 4, channel = status & 15;
+      if (kind < 8 || kind > 14) throw Error('지원하지 않는 MIDI 이벤트입니다.');
+      const key = number(1), velocity = kind === 12 || kind === 13 ? 0 : number(1);
+      if (key > 127 || velocity > 127) throw Error('MIDI 음표 정보가 올바르지 않습니다.');
+      const id = channel * 128 + key;
+      if (kind === 9 && velocity) {
+        const note = { tick, end: tick + 1, channel, key, velocity };
+        notes.push(note);
+        if (!active.has(id)) active.set(id, []);
+        active.get(id).push(note);
+      } else if (kind === 8 || kind === 9) {
+        const queue = active.get(id);
+        const note = queue?.shift();
+        if (note) note.end = Math.max(note.tick + 1, tick);
+        if (!queue?.length) active.delete(id);
+      }
+    }
+    pos = limit;
+    limit = view.byteLength;
+    if (notes.length) tracks.push({ name: name || `트랙 ${tr + 1}`, notes });
+  }
+
+  tempos.sort((a, b) => a.tick - b.tick);
+  let seconds = 0, lastTick = 0, rate = .5 / ppqn;
+  for (const tempo of tempos) {
+    seconds += (tempo.tick - lastTick) * rate;
+    lastTick = tempo.tick;
+    rate = tempo.value / 1e6 / ppqn;
+    Object.assign(tempo, { seconds, rate });
+  }
+  function tempoAt(field, value) {
+    let low = 0, high = tempos.length;
+    while (low + 1 < high) {
+      const mid = (low + high) >> 1;
+      if (tempos[mid][field] <= value) low = mid;
+      else high = mid;
+    }
+    return tempos[low];
+  }
+  function beatTime(beat) {
+    const tick = beat * ppqn, t = tempoAt('tick', tick);
+    return t.seconds + (tick - t.tick) * t.rate;
+  }
+  function timeBeat(time) {
+    const t = tempoAt('seconds', time);
+    return (t.tick + (time - t.seconds) / t.rate) / ppqn;
+  }
+  return tracks.map(track => {
+    let endBeat = 0;
+    for (const note of track.notes) {
+      note.beat = note.tick / ppqn;
+      note.beats = (note.end - note.tick) / ppqn;
+      note.start = beatTime(note.beat);
+      note.duration = beatTime(note.end / ppqn) - note.start;
+      endBeat = Math.max(endBeat, note.end / ppqn);
+    }
+    return { ...track, fourFour, beatTime, timeBeat, endBeat };
+  });
+}
+
+let audio;
+let drumNoise;
+const activePlayers = new Set();
+
+function voice(note, time, destination) {
+  const drum = note.channel === 9;
+  const length = Math.max(.006, drum ? Math.min(.2, note.duration) : note.duration);
+  const envelope = audio.createGain();
+  const peak = note.velocity / 127 * (drum ? .22 : .13);
+  envelope.gain.setValueAtTime(.00001, time);
+  envelope.gain.linearRampToValueAtTime(peak, time + Math.min(.006, length / 3));
+  envelope.gain.exponentialRampToValueAtTime(.00001, time + length);
+  envelope.connect(destination);
+  let source, filter;
+  if (drum && note.key !== 35 && note.key !== 36) {
+    if (!drumNoise) {
+      drumNoise = audio.createBuffer(1, Math.ceil(audio.sampleRate * .21), audio.sampleRate);
+      const data = drumNoise.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    }
+    source = audio.createBufferSource();
+    source.buffer = drumNoise;
+    filter = audio.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = note.key >= 42 ? 6500 : 850;
+    source.connect(filter).connect(envelope);
+  } else {
+    source = audio.createOscillator();
+    source.type = drum ? 'sine' : 'triangle';
+    if (drum) {
+      source.frequency.setValueAtTime(140, time);
+      source.frequency.exponentialRampToValueAtTime(42, time + length);
+    } else {
+      source.frequency.value = 440 * 2 ** ((note.key - 69) / 12);
+    }
+    source.connect(envelope);
+  }
+  source.onended = () => {
+    source.disconnect();
+    filter?.disconnect();
+    envelope.disconnect();
+  };
+  source.start(time);
+  source.stop(time + length);
+  return source;
+}
+
+function makePlayer(volume, update, done) {
+  let timer, output, gain, token = 0, running = false, position = 0;
+  const sources = new Set();
+  const player = {
+    get running() { return running; },
+    get position() { return position; },
+    stop() {
+      token++;
+      running = false;
+      clearInterval(timer);
+      activePlayers.delete(player);
+      for (const source of sources) {
+        try { source.stop(); } catch {}
+      }
+      sources.clear();
+      output?.disconnect();
+      gain?.disconnect();
+      output = gain = null;
+    },
+    async play(notes, from, to, repeat = () => false) {
+      player.stop();
+      const run = token;
+      position = from;
+      running = true;
+      activePlayers.add(player);
+      try {
+        audio ||= new AudioContext();
+        await audio.resume();
+        if (run !== token) return;
+        gain = audio.createGain();
+        gain.gain.value = Number(volume.value) / 100 * .65;
+        gain.connect(audio.destination);
+        const cycle = (start) => {
+          output?.disconnect();
+          output = audio.createGain();
+          output.connect(gain);
+          const base = audio.currentTime + .035 - start;
+          const end = base + to;
+          output.gain.setValueAtTime(0, end);
+          const clip = notes.filter(n => n.start < to && n.start + n.duration > start)
+            .map(n => {
+              const at = Math.max(start, n.start);
+              return { ...n, start: at, duration: Math.min(to, n.start + n.duration) - at };
+            }).sort((a, b) => a.start - b.start);
+          let index = 0;
+          function schedule() {
+            if (run !== token) return;
+            const now = audio.currentTime;
+            position = Math.min(to, Math.max(start, now - base));
+            if (now >= end) {
+              clearInterval(timer);
+              if (repeat()) cycle(from);
+              else {
+                player.stop();
+                done();
+              }
+              return;
+            }
+            while (index < clip.length && base + clip[index].start < now + .12) {
+              const note = clip[index++];
+              const at = Math.max(now, base + note.start);
+              const remaining = base + note.start + note.duration - at;
+              if (remaining <= 0) continue;
+              const source = voice({ ...note, duration: remaining }, at, output);
+              sources.add(source);
+              const cleanup = source.onended;
+              source.onended = () => { cleanup(); sources.delete(source); };
+            }
+            update(position);
+          }
+          timer = setInterval(schedule, 25);
+          schedule();
+        };
+        cycle(from);
+      } catch (error) {
+        if (run === token) {
+          player.stop();
+          done(error);
+        }
+      }
+    }
+  };
+  volume.addEventListener('input', () => {
+    if (gain) gain.gain.setTargetAtTime(Number(volume.value) / 100 * .65, audio.currentTime, .01);
+  });
+  return player;
+}
+
+const parts = [];
+const mix = makePlayer($('mixVolume'), time => {
+  $('mixStatus').textContent = `합쳐 듣는 중 · ${time.toFixed(1)}초`;
+}, error => {
+  $('mixStop').disabled = true;
+  $('mixStatus').textContent = error ? error.message : '4마디 재생 완료';
+});
+
+function stopMix() {
+  mix.stop();
+  $('mixStop').disabled = true;
+  $('mixStatus').textContent = '합쳐 듣기 정지';
+}
+
+function stopAll() {
+  for (const player of [...activePlayers]) {
+    if (player === mix) stopMix();
+    else player.reset();
+  }
+}
+$('stopAll').onclick = stopAll;
+$('mixStop').onclick = stopMix;
+$('bpm').oninput = () => { if (mix.running) stopMix(); };
+
+function addTrack(container, track, players) {
+  const row = document.createElement('article');
+  row.innerHTML = `
+    <h3></h3>
+    <small>초록은 피아노, 주황은 드럼입니다.</small>
+    <canvas aria-hidden="true"></canvas>
+    <small class="position"></small>
+    <input class="seek" aria-label="재생 위치" type="range" min="0" step=".001" value="0">
+    <div class="row">
+      <label>시작(초) <input class="from" type="number" min="0" step=".01" value="0"></label>
+      <label>끝(초) <input class="to" type="number" min="0" step=".01"></label>
+      <label><input class="loop" type="checkbox"> 반복</label>
+    </div>
+    <div class="row">
+      <label>트랙 음량 <input class="volume" type="range" min="0" max="100" value="100"></label>
+    </div>
+    <div class="row">
+      <button class="primary play">재생</button><button class="pause">일시정지</button>
+      <button class="stop">정지</button>
+    </div>
+    <small class="state" role="status"></small>`;
+  row.querySelector('h3').textContent = track.name;
+  container.append(row);
+  const find = (selector) => row.querySelector(selector);
+  const canvas = find('canvas'), seek = find('.seek'), from = find('.from'), to = find('.to');
+  const pen = canvas.getContext('2d');
+  const total = Math.ceil(track.beatTime(track.endBeat) * 100) / 100;
+  seek.max = to.max = from.max = to.value = total;
+  let position = 0, low = 127, high = 0;
+  for (const note of track.notes) {
+    low = Math.min(low, note.key);
+    high = Math.max(high, note.key);
+  }
+  const background = document.createElement('canvas');
+  background.width = canvas.width = 960;
+  background.height = canvas.height = 210;
+  const grid = background.getContext('2d');
+  grid.fillStyle = '#101810';
+  grid.fillRect(0, 0, 960, 210);
+  const x = (time) => 960 * time / total;
+  if (track.fourFour) {
+    const bars = Math.ceil(track.endBeat / 4);
+    const stride = Math.max(1, Math.ceil(bars / 120));
+    let lastLabel = -100;
+    grid.font = '22px system-ui';
+    for (let i = 0; i < bars; i += stride) {
+      const left = x(track.beatTime(i * 4));
+      grid.fillStyle = '#4d6347';
+      grid.fillRect(left, 0, 2, 210);
+      if (left - lastLabel > 100 && left < 900) {
+        grid.fillStyle = '#d0dfc8';
+        grid.fillText(`${i + 1}마디`, left + 5, 25);
+        lastLabel = left;
+      }
+    }
+  }
+  for (const note of track.notes) {
+    const y = 36 + (high - note.key) * 158 / Math.max(1, high - low);
+    grid.fillStyle = note.channel === 9 ? '#f1a66e' : '#b8e28e';
+    grid.fillRect(x(note.start), y, Math.max(2, x(note.duration)), 7);
+  }
+  function draw(time) {
+    position = time;
+    seek.value = time;
+    const beat = Math.max(0, track.timeBeat(time));
+    find('.position').textContent = `${time.toFixed(2)} / ${total.toFixed(2)}초`
+      + (track.fourFour ? ` · ${Math.floor(beat / 4) + 1}마디 ${(beat % 4 + 1).toFixed(1)}박` : '');
+    pen.drawImage(background, 0, 0);
+    pen.fillStyle = '#0009';
+    if (from.valueAsNumber >= 0 && to.valueAsNumber <= total && from.valueAsNumber < to.valueAsNumber) {
+      pen.fillRect(0, 0, x(from.valueAsNumber), 210);
+      pen.fillRect(x(to.valueAsNumber), 0, 960, 210);
+    }
+    pen.fillStyle = '#fff';
+    pen.fillRect(Math.min(957, x(time)), 0, 3, 210);
+  }
+  const player = makePlayer(find('.volume'), draw, error => {
+    draw(player.position);
+    find('.state').textContent = error ? error.message : '재생 완료';
+  });
+  players.push(player);
+  player.reset = () => {
+    player.stop();
+    draw(Math.min(total, Math.max(0, from.valueAsNumber || 0)));
+    find('.state').textContent = '정지';
+  };
+  function play() {
+    const a = from.valueAsNumber, b = to.valueAsNumber;
+    if (!(a >= 0 && b <= total && a < b)) {
+      find('.state').textContent = '시작과 끝 시간을 확인하세요.';
+      return;
+    }
+    if (mix.running) stopMix();
+    if (position < a || position >= b) position = a;
+    find('.state').textContent = '재생 중';
+    player.play(track.notes, position, b, () => find('.loop').checked);
+  }
+  function move(time) {
+    const wasRunning = player.running;
+    draw(Math.max(0, Math.min(total, time)));
+    if (wasRunning) play();
+  }
+  find('.play').onclick = play;
+  find('.stop').onclick = player.reset;
+  find('.pause').onclick = () => {
+    player.stop();
+    find('.state').textContent = '일시정지';
+  };
+  from.onchange = to.onchange = player.reset;
+  seek.oninput = () => move(Number(seek.value));
+  canvas.onclick = event => {
+    const rect = canvas.getBoundingClientRect();
+    move((event.clientX - rect.left) / rect.width * total);
+  };
+  draw(0);
+}
+
+function refresh() {
+  const ready = parts.every(part => part.tracks.some(track => track.fourFour));
+  $('mixPlay').disabled = $('save').disabled = !ready;
+}
+
+for (let i = 0; i < 2; i++) {
+  const panel = document.createElement('section');
+  panel.innerHTML = `<h2>파일 ${i + 1}</h2><label>MIDI 파일 열기
+    <input type="file" accept=".mid,.midi,audio/midi"></label><p role="status"></p><div></div>`;
+  $('files').append(panel);
+  const choice = document.createElement('div');
+  choice.className = 'choice';
+  choice.innerHTML = `<label>파일 ${i + 1} 트랙 <select disabled></select></label>
+    <label>시작 마디 <input type="number" min="1" step="1" value="1" disabled></label>`;
+  $('choices').append(choice);
+  const select = choice.querySelector('select'), bar = choice.querySelector('input');
+  const file = panel.querySelector('input'), info = panel.querySelector('p');
+  const list = panel.querySelector('div');
+  const part = { tracks: [], select, bar, players: [], load: 0 };
+  parts.push(part);
+  select.onchange = bar.oninput = () => { if (mix.running) stopMix(); };
+
+  file.onchange = async () => {
+    const selected = file.files[0];
+    if (!selected) return;
+    const load = ++part.load;
+    if (mix.running) stopMix();
+    for (const player of part.players) player.stop();
+    part.tracks = [];
+    part.players = [];
+    list.replaceChildren();
+    select.replaceChildren();
+    select.disabled = bar.disabled = true;
+    refresh();
+    info.textContent = '파일 읽는 중…';
+    try {
+      if (selected.size > 20 * 1024 * 1024) throw Error('20MB 이하 MIDI 파일을 선택하세요.');
+      const tracks = parseMidi(await selected.arrayBuffer());
+      if (load !== part.load) return;
+      part.tracks = tracks;
+      info.textContent = `${selected.name} · 음표가 있는 트랙 ${tracks.length}개`;
+      tracks.forEach((track, index) => {
+        const option = new Option(track.name, index);
+        option.disabled = !track.fourFour;
+        select.append(option);
+        addTrack(list, track, part.players);
+      });
+      const first = tracks.findIndex(track => track.fourFour);
+      select.selectedIndex = first;
+      select.disabled = bar.disabled = first < 0;
+      bar.value = 1;
+      refresh();
+      $('mixStatus').textContent = $('mixPlay').disabled
+        ? '합쳐 듣기에는 4/4 트랙 두 개가 필요합니다.' : '두 트랙의 시작 마디를 선택하세요.';
+    } catch (error) {
+      if (load === part.load) info.textContent = error.message;
+    }
+  };
+}
+
+function selectedNotes() {
+  return parts.flatMap(({ tracks, select, bar }) => {
+    const track = tracks[select.selectedIndex], startBar = bar.valueAsNumber;
+    if (!track?.fourFour) throw Error('파일마다 4/4 트랙 하나를 선택하세요.');
+    if (!Number.isSafeInteger(startBar) || startBar < 1) throw Error('시작 마디는 1 이상의 정수로 입력하세요.');
+    const start = (startBar - 1) * 4, end = start + 16;
+    if (start >= track.endBeat) throw Error('시작 마디를 트랙 안으로 지정하세요.');
+    return track.notes.filter(n => n.beat < end && n.beat + n.beats > start).map(n => {
+      const first = Math.max(n.beat, start);
+      const last = Math.min(n.beat + n.beats, end);
+      return { ...n, beat: first - start, beats: last - first };
+    });
+  });
+}
+
+$('mixPlay').onclick = () => {
+  try {
+    const bpm = $('bpm').valueAsNumber;
+    if (!(bpm >= 30 && bpm <= 300)) throw Error('BPM을 30~300 사이로 입력하세요.');
+    const seconds = 60 / bpm;
+    const notes = selectedNotes().map(n => ({
+      ...n, start: n.beat * seconds, duration: n.beats * seconds
+    }));
+    stopAll();
+    $('mixStop').disabled = false;
+    $('mixStatus').textContent = '재생 준비 중…';
+    mix.play(notes, 0, 16 * seconds);
+  } catch (error) { $('mixStatus').textContent = error.message; }
+};
+
+function midiBytes(notes) {
+  const ppqn = 960, endTick = 16 * ppqn;
+  function vlq(value) {
+    const bytes = [value & 127];
+    while ((value >>= 7)) bytes.unshift((value & 127) | 128);
+    return bytes;
+  }
+  function chunk(name, data) {
+    const tag = Array.from(name, c => c.charCodeAt(0));
+    const size = [data.length >>> 24, data.length >>> 16 & 255,
+      data.length >>> 8 & 255, data.length & 255];
+    return new Uint8Array(tag.concat(size, data));
+  }
+  function track(name, events) {
+    const title = Array.from(name, c => c.charCodeAt(0));
+    const data = [0, 255, 3, title.length, ...title];
+    events.sort((a, b) => a.tick - b.tick || a.order - b.order);
+    let last = 0;
+    for (const event of events) {
+      data.push(...vlq(event.tick - last), ...event.bytes);
+      last = event.tick;
+    }
+    data.push(...vlq(endTick - last), 255, 47, 0);
+    return chunk('MTrk', data);
+  }
+  const piano = [{ tick: 0, order: -1, bytes: [192, 0] }], drums = [];
+  for (const note of notes) {
+    const ch = note.channel === 9 ? 9 : 0;
+    const events = ch === 9 ? drums : piano;
+    const start = Math.min(endTick - 1, Math.round(note.beat * ppqn));
+    const end = Math.min(endTick, Math.max(start + 1, Math.round((note.beat + note.beats) * ppqn)));
+    events.push({ tick: start, order: 1, bytes: [144 | ch, note.key, note.velocity] });
+    events.push({ tick: end, order: 0, bytes: [128 | ch, note.key, 0] });
+  }
+  const tempo = 666667;
+  return [
+    chunk('MThd', [0, 1, 0, 3, ppqn >> 8, ppqn & 255]),
+    track('Tempo', [
+      { tick: 0, order: 0, bytes: [255, 81, 3, tempo >> 16, tempo >> 8 & 255, tempo & 255] },
+      { tick: 0, order: 1, bytes: [255, 88, 4, 4, 2, 24, 8] }
+    ]),
+    track('Piano', piano),
+    track('Drums', drums)
+  ];
+}
+
+$('save').onclick = () => {
+  try {
+    const url = URL.createObjectURL(new Blob(midiBytes(selectedNotes()), { type: 'audio/midi' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'midi-room-4bars-90bpm.mid';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+    if (!mix.running) $('mixStatus').textContent = '4마디 MIDI 다운로드를 시작했습니다.';
+  } catch (error) { $('mixStatus').textContent = error.message; }
+};
+</script>
+</html>
